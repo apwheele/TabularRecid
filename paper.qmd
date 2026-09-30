@@ -1,0 +1,411 @@
+---
+title: "Tabular foundation models for recidivism prediction with small samples"
+author: "Andrew P. Wheeler"
+abstract: |
+  Agencies that build recidivism risk tools usually have hundreds or a few
+  thousand cases, not the 18,000 in the NIJ Recidivism Forecasting Challenge.
+  Tabular foundation models are pretrained on millions of synthetic tables and
+  predict new cases in one pass with no tuning. I compare NVIDIA's Kumo Tabular
+  to logistic regression, a random forest, LightGBM, and CatBoost on the NIJ
+  Georgia parole data, fitting each to ten random training samples of 500 to
+  16,000 people and the full training sample, and scoring them on the NIJ test
+  sample. Rounds 2 and 3 are fit only to people with no arrest in earlier
+  years, which is what the conditional predictions require. From 1,000 cases
+  on, Kumo has the best Brier score and AUC, and with 1,000 to 4,000 cases it
+  matches the other models fit on twice as much data. At 500 cases a random
+  forest does as well or better. With the full samples the models converge in round 1,
+  but Kumo keeps a clear lead in rounds 2 and 3, and it would have placed at or
+  above the small team winners on the challenge leaderboard. Accuracy measured
+  on small samples varies a lot from one draw to the next. Code and data are at
+  https://github.com/apwheele/TabularRecid.
+bibliography: references.bib
+link-citations: true
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    number-sections: true
+    fig-pos: "H"
+    header-includes:
+      - \usepackage{float}
+      - \usepackage{booktabs}
+  gfm:
+    fig-dpi: 150
+    wrap: none
+    filters:
+      - filters/github-math.lua
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: tabrecid
+---
+
+```{python}
+#| label: setup
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from tabrecid import report
+from tabrecid.models import LABELS
+
+andy_theme = {
+    "axes.grid": True,
+    "grid.linestyle": "--",
+    "grid.color": "#d9d8d4",
+    "legend.framealpha": 1,
+    "legend.facecolor": "white",
+    "legend.shadow": True,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "axes.labelsize": 10,
+    "axes.titlesize": 11,
+    "axes.titlelocation": "left",
+    "figure.dpi": 150,
+}
+matplotlib.rcParams.update(andy_theme)
+
+num = lambda v, d=3: "--" if pd.isna(v) else f"{v:.{d}f}"
+pct = lambda v, d=0: "--" if pd.isna(v) else f"{v * 100:.{d}f}%"
+com = lambda v: "--" if pd.isna(v) else f"{int(round(v)):,}"
+
+MAIN = ["kumo_small", "logit", "rf", "lgbm", "catboost"]
+STYLE = {
+    "kumo_small": {"color": "#2a78d6", "marker": "o"},
+    "logit": {"color": "#eb6834", "marker": "s"},
+    "rf": {"color": "#1baf7a", "marker": "^"},
+    "lgbm": {"color": "#b07a00", "marker": "D"},
+    "catboost": {"color": "#d55181", "marker": "v"},
+    "tabicl": {"color": "#008300", "marker": "P"},
+    "tabpfn": {"color": "#7a5bd6", "marker": "X"},
+}
+
+raw_all = report.samples()
+summ = report.summary(raw_all)
+lb = report.leaderboard()
+
+
+def S(model, round_, size, col, group="All", features="raw"):
+    """Summary value; size may be 'full'."""
+    q = summ[(summ.model == model) & (summ["round"] == round_) & (summ.group == group) & (summ.features == features)]
+    q = q[q.full] if size == "full" else q[q["size"] == size]
+    return q.iloc[0][col] if len(q) else np.nan
+
+
+def full_n(round_):
+    q = summ[(summ["round"] == round_) & summ.full]
+    return int(q["size"].iloc[0])
+```
+
+# Introduction
+
+Most agencies that want a recidivism risk tool do not have tens of thousands of cases to build it on. A probation department in a mid-sized county may release a few hundred people a year. A police department building a list of people at high risk of gun violence may have even fewer outcomes to learn from [@wheeler2019void]. The NIJ Recidivism Forecasting Challenge gave entrants over 18,000 Georgia parolees to train on [@nij2021challenge]. That is not the typical situation.
+
+The obvious fix is to borrow a model built somewhere else. That does not work as well as you would hope. @hamilton2022local show that risk tools tuned to a local population predict better than the same tool carried over from another one; prediction is local. Jurisdictions also just collect different data. One agency has drug test results and employment, another has neither, and a third codes prior arrests in a way nobody else does. A model that expects a set of fields another agency does not have cannot be applied there at all.
+
+So the agency is left fitting its own model on a small sample. Two things go wrong with that. The first is accuracy: machine learning models that need tuning tend to do worse with fewer cases, and small agencies rarely have someone on staff to tune them. The second is variance. With a small holdout sample, the accuracy you measure is itself noisy. On the NIJ data, simply redrawing the train and test split moves the Brier score by about 0.002 and the AUC by about 0.005, which is larger than the gaps between the top teams on the leaderboard [@wheeler2021variance]. An agency checking whether its model is any good needs some idea of how much those numbers bounce around.
+
+Tabular foundation models are a new option for the first problem. They are neural networks pretrained on millions of synthetic tables. At prediction time you give the model your training rows as context and it returns predictions for new rows in a single forward pass, with no fitting and no hyperparameter tuning [@hollmann2025tabpfn; @qu2026tabiclv2; @nvidia2026kumo]. On public benchmarks they beat tuned gradient boosting, and the gains are largest on small datasets. That is the right shape for the agency problem, but benchmark suites are not criminal justice data, and recidivism is a noisy outcome where most models land in the same place [@duwe2017out; @circo2025replication; @wheeler2023relaxed].
+
+This paper tests one of these models, NVIDIA's Kumo Tabular [@nvidia2026kumo], on the NIJ data, against logistic regression, a random forest, LightGBM, and CatBoost. I take random samples of 500 to 16,000 people from the NIJ training data, ten samples at each size, fit every model to the same samples, and score them on the NIJ test sample. The ten samples show how much accuracy varies from one draw to the next at each size. I do this for all three rounds of the challenge. Rounds 2 and 3 predict an arrest in year 2 or 3 among people not arrested earlier, and the training data have to be restricted the same way to get those conditional predictions right. I report Brier scores and AUC overall and by race and sex, and compare the full-sample models to the challenge leaderboard.
+
+# Tabular foundation models
+
+Deep learning has not historically done well on tabular data. Tree ensembles, such as random forests and gradient boosting, have been the default, and careful comparisons found they still beat neural networks on typical tables [@grinsztajn2022tree]. Criminology has a similar finding for recidivism. Machine learning models are often no better than logistic regression, and when they are, the gains are small [@duwe2017out]. The NIJ challenge confirmed this: the winning entries in each round were separated in the third or fourth decimal of the Brier score, and those gaps are within what you would expect from sampling variation alone [@wheeler2021variance; @circo2025replication].
+
+Tabular foundation models change how the model is built. TabPFN was the first widely used one [@hollmann2025tabpfn]. It is a transformer trained once, ahead of time, on millions of artificial datasets drawn from structural causal models. Each artificial dataset is split into training and test rows, and the network learns to predict the test rows given the training rows. When you use it on real data, "fitting" just means passing your training rows in as context. The network has learned, in effect, how to do supervised learning on small tables. Later models such as TabICLv2 [@qu2026tabiclv2] and Kumo Tabular [@nvidia2026kumo] follow the same recipe with architectures that scale to larger tables. Kumo Tabular was pretrained only on synthetic tables of up to 100 columns and 60,000 rows, and ranks first on several public benchmarks [@nvidia2026kumo].
+
+Two features matter for an analyst. There is nothing to tune, so the quality of the model does not depend on how much time someone spent on a hyperparameter search. And the models take mixed numeric and categorical columns with missing values, so less data preparation is needed. The cost is compute. Prediction requires attending over every training row, so the model is slow on a CPU and wants a GPU for larger samples.
+
+# Data and methods
+
+## The NIJ data and the three rounds
+
+The data are the NIJ Recidivism Forecasting Challenge full file: 25,835 people released from Georgia prisons to parole supervision from 2013 through 2015 [@nij2022data]. NIJ split the file into a training sample of 18,028 and a test sample of 7,807. I keep that split. Every model below is scored on the NIJ test sample, and the test sample is never used to fit or tune anything.
+
+The challenge had three rounds [@nij2021challenge]. Round 1 forecast a new arrest in the first year after release, using what was known at release: age, sex, supervision level and risk score, education, prison offense and time served, gang membership, residence area (PUMA), prior arrests and convictions, prior revocations, and parole conditions. Rounds 2 and 3 forecast an arrest in year 2 and year 3. For those rounds NIJ added fields that describe supervision: drug tests, employment, program attendance, violations, delinquency reports, and residence changes. I follow the same rules. Round 1 uses only the release fields, and rounds 2 and 3 add the supervision fields. Race is not used as a predictor in any model; it is only used to break out the accuracy metrics. The outcomes for later years are never predictors.
+
+## Why rounds 2 and 3 condition on the prior rounds
+
+In round 2 NIJ's test sample only included people who were not arrested in year 1. The target is the probability of an arrest in year 2 given no arrest in year 1. In survival terms this is the discrete-time hazard for year 2 [@wheeler2020discrete]. Round 3 is the hazard for year 3, among people with no arrest in years 1 or 2.
+
+The training data have to be restricted the same way. In the NIJ file the year 2 outcome is 0 for anyone arrested in year 1; they cannot have a first arrest in year 2 because they already had one. If you train a year 2 model on everyone, the people with the highest risk, the ones who failed quickly, are labeled as successes. That biases the predictions down for exactly the kind of person the model should flag, and it drags the overall predicted rate below the rate among the people you will actually score. So for round 2 I train only on training cases with no year 1 arrest, and for round 3 only on cases with no arrest in years 1 or 2. The Circo and Wheeler replication did this for round 2 [@circo2025replication]. I show below what happens when you do not.
+
+## Features
+
+There are two versions of the features. The sample-size comparison uses the first, and both are fit to the full training samples for the leaderboard comparison and Appendix B. The first version uses no feature engineering. The columns go in as NIJ distributed them: text fields such as "10 or more" prior felony arrests or "Violent/Non-Sex" prison offense are categories, true and false fields are categories, and missing values are left missing. LightGBM, CatBoost, and Kumo Tabular all accept categorical columns directly. The logistic regression dummy codes them. The random forest needs numbers, so its text columns are replaced with integer codes in alphabetical order, which is what you get when you do not think about it.
+
+The second version is the feature engineering we used in the challenge [@wheeler2021variance; @circo2025replication]. Ordered categories get ordered codes (age groups, education, supervision level, time served, offense severity), top-coded counts keep the leading number, true and false are 0 and 1, missing values get their own code, and there are indicators for the fields that are often missing. I also add totals for prior arrests and prior convictions. For rounds 2 and 3 there are indicators for people with no drug tests and no employment record.
+
+## Models
+
+The four comparison models are logistic regression, a random forest [@breiman2001random; @pedregosa2011scikit], LightGBM [@ke2017lightgbm], and CatBoost [@prokhorenkova2018catboost]. I give them the light tuning an analyst could do without much effort. The logistic regression has an L2 penalty chosen by five-fold cross-validated Brier score. Its inputs are standardized, text columns are dummy coded with missing as its own level, and numeric columns get a missing indicator. The random forest has 500 trees and picks its minimum leaf size (1, 5, 10, 25, or 50) by out-of-bag Brier score. The two boosted models pick the number of trees by early stopping on a random 20% of the training sample, and are then refit on all of it with that number of trees. Everything else is at the package defaults.
+
+Kumo Tabular is used as it ships, with no tuning: the small model (28 million parameters), 8 ensemble members, run on a GPU [@nvidia2026kumo; @nvidia2026sdm]. In a check on the full round 1 sample with four ensemble members, the medium model (71 million parameters) gave the same test Brier score to three decimals as the small one and took about 20 times longer on my 4 GB GPU. The large model did not fit in GPU memory. The appendix repeats the main comparison for two other tabular foundation models, TabICLv2 [@qu2026tabiclv2] and TabPFN version 2 [@hollmann2025tabpfn].
+
+## Sample sizes and metrics
+
+For each round I draw simple random samples from the NIJ training data (restricted to the round's risk set) of 500, 1,000, 2,000, 4,000, 8,000, and 16,000 people, stopping below the size of the risk set, and then use the full training sample. There are ten samples at each size. All five models are fit to the same ten samples, and each model's random seed is the sample number, so the full-sample replications differ only in the seed.
+
+Accuracy is measured on the NIJ test sample with the Brier score, the mean squared difference between the predicted probability and the 0/1 outcome, and the area under the ROC curve (AUC). Lower Brier scores are better, higher AUC is better. The Brier score was the challenge's accuracy metric, and it was computed separately for men and women [@nij2021challenge]. The Brier score rewards calibration as well as ranking. AUC only measures ranking. I report both overall and by race and sex, as in @wheeler2026conformal.
+
+# Results
+
+## Accuracy by sample size
+
+```{python}
+#| label: fig-curves
+#| fig-cap: "Brier score (left, lower is better) and AUC (right, higher is better) on the NIJ test sample, by training sample size. Rows are the three rounds. Small points are the ten random samples at each size, lines connect the means. The last point in each panel is the full training sample. The horizontal axis is on a log scale."
+#| fig-width: 7.5
+#| fig-height: 9
+fig, axes = plt.subplots(3, 2, figsize=(7.5, 9))
+rng = np.random.default_rng(1)
+for row, rnd in enumerate([1, 2, 3]):
+    for col, (metric, lab) in enumerate([("brier", "Brier score"), ("auc", "AUC")]):
+        ax = axes[row, col]
+        for k, m in enumerate(MAIN):
+            st = STYLE[m]
+            pts = raw_all[(raw_all.model == m) & (raw_all["round"] == rnd) & (raw_all.group == "All") & (raw_all.features == "raw")]
+            if pts.empty:
+                continue
+            jit = np.exp(rng.uniform(-0.04, 0.04, len(pts)) + (k - 2) * 0.04)
+            ax.scatter(pts["size"] * jit, pts[metric], s=6, color=st["color"], alpha=0.35, lw=0)
+            mean = pts.groupby("size")[metric].mean()
+            ax.plot(mean.index, mean.values, "-", marker=st["marker"], color=st["color"], ms=5,
+                    markeredgecolor="white", lw=1.6, label=LABELS[m])
+        ax.set_xscale("log")
+        sizes = sorted(raw_all.loc[raw_all["round"] == rnd, "size"].unique())
+        full = sizes[-1]
+        ticks = [s for s in sizes[:-1] if full / s > 1.4] + [full]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"Full\n{full / 1000:.1f}k" if s == full else (f"{s // 1000}k" if s >= 1000 else str(s)) for s in ticks], fontsize=8)
+        ax.minorticks_off()
+        if col == 0:
+            ax.set_ylabel(f"Round {rnd}\n{lab}")
+        else:
+            ax.set_ylabel(lab)
+        if row == 0:
+            ax.set_title(lab)
+        if row == 2:
+            ax.set_xlabel("Training sample size")
+axes[0, 1].legend(loc="lower right")
+fig.tight_layout()
+```
+
+```{python}
+#| label: tbl-round1
+#| output: asis
+rows = []
+for size in [500, 1000, 2000, 4000, 8000, 16000, "full"]:
+    row = {"Sample": "Full (" + com(full_n(1)) + ")" if size == "full" else com(size)}
+    for m in MAIN:
+        b, sd = S(m, 1, size, "brier"), S(m, 1, size, "brier_sd")
+        row[LABELS[m]] = f"{num(b, 4)} ({num(sd, 4)})"
+    rows.append(row)
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Round 1 Brier score on the NIJ test sample, mean (standard deviation) over ten random training samples. At the full training sample only the model seed changes.")
+```
+
+@fig-curves shows the results for each round, and @tbl-round1 gives the round 1 Brier scores. Start with round 1. With 500 people, the random forest and Kumo Tabular are tied on the Brier score (`{python} num(S('rf',1,500,'brier'),4)` and `{python} num(S('kumo_small',1,500,'brier'),4)`), and the two boosted models are the worst. Kumo has the higher AUC, `{python} num(S('kumo_small',1,500,'auc'),3)` against `{python} num(S('rf',1,500,'auc'),3)`. From 1,000 people on, Kumo has the best average Brier score and AUC at every size. Because every model gets the same ten samples, the comparisons are paired. From 1,000 through 4,000 people Kumo has a lower Brier score than every other model in every one of the ten samples.
+
+The easiest way to read the gap is in sample size. Kumo with 1,000 people (`{python} num(S('kumo_small',1,1000,'brier'),4)`) does about as well as the random forest or logistic regression with 2,000 (`{python} num(S('rf',1,2000,'brier'),4)` and `{python} num(S('logit',1,2000,'brier'),4)`). Kumo with 2,000 (`{python} num(S('kumo_small',1,2000,'brier'),4)`) matches CatBoost with 4,000 (`{python} num(S('catboost',1,4000,'brier'),4)`), and Kumo with 4,000 matches CatBoost with 8,000. For a small agency, the foundation model is worth about as much as doubling the sample.
+
+The advantage shrinks as the sample grows. With the full training sample of `{python} com(full_n(1))`, Kumo's Brier score is `{python} num(S('kumo_small',1,'full','brier'),4)`, CatBoost's is `{python} num(S('catboost',1,'full','brier'),4)`, and logistic regression's is `{python} num(S('logit',1,'full','brier'),4)`. Differences of 0.001 are well within what a different test sample would produce [@wheeler2021variance]. LightGBM and the random forest trail at every size past 4,000. Logistic regression is never far from CatBoost, which is the usual finding for recidivism data [@duwe2017out].
+
+The spread across the ten samples is the other half of the story. At 500 people the standard deviation of the Brier score is between `{python} num(min(S(m,1,500,'brier_sd') for m in MAIN),4)` and `{python} num(max(S(m,1,500,'brier_sd') for m in MAIN),4)` depending on the model, and the AUC varies by one to two and a half points (standard deviations of `{python} num(min(S(m,1,500,'auc_sd') for m in MAIN),3)` to `{python} num(max(S(m,1,500,'auc_sd') for m in MAIN),3)`). By 2,000 people the AUC standard deviations are around 0.005, and the Brier standard deviations are under 0.001 for every model but LightGBM, which has one poor draw at that size. Keep in mind this is only the variation from the training draw. Every score here is on the same NIJ test sample of `{python} com(S('kumo_small',1,500,'n'))` people. An agency with 500 cases would also be testing on a small holdout, which adds its own noise on top.
+
+## Race and sex
+
+```{python}
+#| label: tbl-groups
+#| output: asis
+GROUPS = ["Black men", "White men", "Black women", "White women"]
+SHORT = {"kumo_small": "Kumo", "logit": "Logit", "rf": "RF", "lgbm": "LightGBM", "catboost": "CatBoost"}
+rows = []
+for metric, mlab in [("brier", "Brier"), ("auc", "AUC")]:
+    for size in [1000, "full"]:
+        for g in GROUPS:
+            row = {"Metric": mlab, "Sample": "1,000" if size == 1000 else "Full", "Group": g,
+                   "N test": com(S("kumo_small", 1, size, "n", g))}
+            for m in MAIN:
+                row[SHORT[m]] = num(S(m, 1, size, metric, g), 3)
+            rows.append(row)
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Round 1 Brier score and AUC on the NIJ test sample by race and sex, mean over ten samples, for training samples of 1,000 and the full training sample. Logit is logistic regression and RF the random forest.")
+```
+
+@tbl-groups breaks the round 1 results out by race and sex. With 1,000 training cases, Kumo has the lowest Brier score and highest AUC in all four groups, except that logistic regression ties it on the Brier score for White women. The groups differ more from each other than the models do. Black women have the highest AUC for every model, White women and Black men the lowest, and women have much lower Brier scores than men because fewer of them are arrested. With the full training sample the models are close in every group, and CatBoost has a slightly higher AUC than Kumo for White women (`{python} num(S('catboost',1,'full','auc','White women'),3)` against `{python} num(S('kumo_small',1,'full','auc','White women'),3)`). The test sample has only `{python} com(S('kumo_small',1,'full','n','White women'))` White women and `{python} com(S('kumo_small',1,'full','n','Black women'))` Black women, so the group AUCs for women move around by a point or more from one draw to the next.
+
+## Rounds 2 and 3
+
+```{python}
+#| label: tbl-conditional
+#| output: asis
+try:
+    cond = report.conditional()
+except FileNotFoundError:
+    cond = pd.DataFrame(columns=["round", "model", "train", "group"])
+rows = []
+for rnd in [2, 3]:
+    for m in ["catboost", "kumo_small"]:
+        for tr in ["risk set", "naive"]:
+            q = cond[(cond["round"] == rnd) & (cond.model == m) & (cond["train"] == tr) & (cond.group == "All")]
+            if q.empty:
+                continue
+            q = q.iloc[0]
+            rows.append({
+                "Round": str(rnd), "Model": LABELS[m], "Training data": tr, "N train": com(q["n_train"]),
+                "Test arrest rate": pct(q["base_rate"], 1), "Mean prediction": pct(q["mean_pred"], 1),
+                "Brier": num(q["brier"], 4), "AUC": num(q["auc"], 3),
+            })
+if not rows:
+    rows = [{"Round": "--", "Model": "pending", "Training data": "--"}]
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Rounds 2 and 3 fit two ways on the full training sample with engineered features, scored on the round's test sample. The risk set drops people arrested in an earlier year. The naive fit keeps them, with an outcome of 0.")
+```
+
+@tbl-conditional shows why the later rounds have to condition on the earlier ones. Fit on everyone, with earlier arrests coded as 0, the models predict too low. In round 2 the naive CatBoost model's average prediction is `{python} pct(cond.query("round==2 and model=='catboost' and train=='naive' and group=='All'")['mean_pred'].iloc[0],1)` for a group where `{python} pct(cond.query("round==2 and model=='catboost' and train=='naive' and group=='All'")['base_rate'].iloc[0],1)` are arrested, and in round 3 it is `{python} pct(cond.query("round==3 and model=='catboost' and train=='naive' and group=='All'")['mean_pred'].iloc[0],1)` against `{python} pct(cond.query("round==3 and model=='catboost' and train=='naive' and group=='All'")['base_rate'].iloc[0],1)`. The ranking gets worse too, not just the calibration. The round 3 AUC falls from `{python} num(cond.query("round==3 and model=='catboost' and train=='risk set' and group=='All'")['auc'].iloc[0],3)` to `{python} num(cond.query("round==3 and model=='catboost' and train=='naive' and group=='All'")['auc'].iloc[0],3)`, because the people who look riskiest in the training data are the ones who failed early and were labeled 0. Kumo has the same problem. No model fixes a mislabeled target, so everything else in this paper uses the risk set.
+
+The lower panels of @fig-curves show rounds 2 and 3. Here Kumo's lead is larger and does not close as the sample grows. In round 2 it has the lowest Brier score in every sample against every model at every size, except for two of the ten samples of 500 where the random forest wins. With the full round 2 sample of `{python} com(full_n(2))`, Kumo's Brier score is `{python} num(S('kumo_small',2,'full','brier'),4)` against `{python} num(S('catboost',2,'full','brier'),4)` for CatBoost and `{python} num(S('logit',2,'full','brier'),4)` for logistic regression, and its AUC is `{python} num(S('kumo_small',2,'full','auc'),3)` against `{python} num(S('catboost',2,'full','auc'),3)` and `{python} num(S('logit',2,'full','auc'),3)`. Kumo with 2,000 people (`{python} num(S('kumo_small',2,2000,'brier'),4)`) beats logistic regression on the full sample, and Kumo with 4,000 (`{python} num(S('kumo_small',2,4000,'brier'),4)`) beats CatBoost with 8,000 (`{python} num(S('catboost',2,8000,'brier'),4)`).
+
+The rounds 2 and 3 models add the supervision fields: drug test results, employment, program attendance, and violations. Logistic regression falls behind the tree models once those are in, which suggests they matter in nonlinear ways or through interactions that a main-effects logit does not have. Kumo picks those up without being told. Round 3 has fewer arrests to learn from, and at 500 people the random forest beats Kumo in eight of ten samples. From 2,000 people on, Kumo is ahead of every model in every sample. With the full round 3 sample, Kumo's full-sample Brier score is `{python} num(S('kumo_small',3,'full','brier'),4)`, CatBoost's is `{python} num(S('catboost',3,'full','brier'),4)`, and logistic regression's is `{python} num(S('logit',3,'full','brier'),4)`.
+
+## Comparison to the challenge leaderboard
+
+```{python}
+#| label: tbl-leaderboard
+#| output: asis
+rows = []
+for rnd in [1, 2, 3]:
+    for m, feat in [(m, "raw") for m in MAIN] + [("kumo_small", "fe")]:
+        men, women = S(m, rnd, "full", "brier", "Men", feat), S(m, rnd, "full", "brier", "Women", feat)
+        lab = LABELS[m] + (", engineered" if feat == "fe" else "")
+        rows.append({"Round": str(rnd), "Entry": lab, "Men": num(men, 4), "Women": num(women, 4),
+                     "Average": num((men + women) / 2, 4)})
+    for _, r in lb[lb["round"] == rnd].iterrows():
+        cat = "Small team" if r["category"] == "small" else "Large team"
+        place = "1st" if r["place"] == 1 else f"{r['place']}th"
+        rows.append({"Round": str(rnd), "Entry": f"Leaderboard, {cat.lower()} {place}",
+                     "Men": num(r["men"], 4), "Women": num(r["women"], 4), "Average": num(r["average"], 4)})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Brier scores on the NIJ test sample with the full training sample, against the published leaderboard [@nij2022results]. Model rows are the mean of ten seeds. Leaderboard rows give the first place and last listed place (4th for small teams, 5th for large teams) score in each column; the team can differ by column.")
+```
+
+@tbl-leaderboard puts the full-sample models next to the published leaderboard. NIJ scored men and women separately, and the average column is the mean of the two. Kumo Tabular, with no feature engineering and no tuning, would have been competitive in every round. In round 1 its Brier score for men, `{python} num(S('kumo_small',1,'full','brier','Men'),4)`, is lower than the small team winner's `{python} num(lb.query("round==1 and category=='small' and place==1")['men'].iloc[0],4)`, and its average is lower than the small team's best average. In round 2 it beats the small team winners in all three columns by a wide margin. Round 2 was the one Gio Circo and I won for small teams [@circo2025replication], so the off-the-shelf model does better than our tuned XGBoost did. In round 3 it beats the small team winners for men and on the average, not for women.
+
+It does not beat the large team winners in rounds 2 and 3. TrueFit and IdleSpeculation had average Brier scores of `{python} num(lb.query("round==2 and category=='large' and place==1")['average'].iloc[0],4)` in round 2 and `{python} num(lb.query("round==3 and category=='large' and place==1")['average'].iloc[0],4)` in round 3, against Kumo's `{python} num((S('kumo_small',2,'full','brier','Men')+S('kumo_small',2,'full','brier','Women'))/2,4)` and `{python} num((S('kumo_small',3,'full','brier','Men')+S('kumo_small',3,'full','brier','Women'))/2,4)`. Those gaps are bigger than leaderboard noise, so those teams found something in the supervision data that Kumo does not. Engineered features do not close the gap: Kumo's round 2 average is essentially unchanged with them.
+
+Two caveats. First, the leaderboard and the models here are scored on the same single test sample, so differences of a thousandth or two are within noise [@wheeler2021variance]. Second, several entries adjusted their predictions to do well on the fairness prize, which costs a little accuracy [@wheeler2021variance; @mohler2021note]. Neither point changes the conclusion that an off-the-shelf foundation model lands among the better entries.
+
+# Discussion
+
+An off-the-shelf tabular foundation model, with no tuning and no feature engineering, predicted recidivism on the NIJ data as well as or better than the usual machine learning models at every sample size past 1,000. The gain is largest where agencies actually are. With 1,000 to 4,000 cases it is worth about the same as doubling the sample. With the full samples the models mostly converge in round 1, but Kumo keeps a clear lead in rounds 2 and 3, where the supervision fields matter. Against the challenge leaderboard it lands at or above the small team winners, including the model Gio Circo and I built.
+
+For a small agency the practical advice is simple. If you have a few thousand cases, fit a foundation model alongside whatever you would have used, and compare them on a holdout. Expect the accuracy numbers to bounce around: with 500 cases, the AUC moved by one to two and a half points from one training draw to the next even with a large, fixed test sample. With 500 cases, a random forest was as good or better, so there is no free lunch at the smallest sizes.
+
+The later rounds also need the right training data. A model for the chance of an arrest in year 2 has to be trained on people who were not arrested in year 1. Training on everyone labels the early failures as successes, and no model can recover from that.
+
+## Other applications
+
+Nothing here is specific to parole. Police departments that keep lists of people at high risk of being involved in gun violence face the same problem with even smaller samples. The Violent Offender Identification Directive in Syracuse is a point-based tool of this kind [@wheeler2019void], and a department building one only has its own local history to learn from. The same goes for place-based prediction, where the rows are street segments or grid cells and the features are counts of nearby risk factors [@wheeler2021rtm]. I have not tested either one.
+
+There are also foundation models for time series, built the same way. Crime analysts spend much of their time asking whether this month's count is unusual, which is a forecasting question with an error band [@wheeler2016tables; @yim2020homicide; @wheeler2018volatile; @wheeler2026decomp]. Whether a pretrained forecaster gives sensible bands for short, noisy crime series is an open question. The recidivism problem itself is a survival problem. This paper followed the challenge and fit each year as its own risk set. A more natural setup would stack the person-years into one discrete-time dataset, with year as a feature, and fit the hazard in one model [@wheeler2020discrete]. It is not clear how well the tabular models handle that stacked structure, since the rows for the same person are not independent draws.
+
+## Limitations
+
+A tabular foundation model is a complicated black box. Tens of millions of parameters decide how much weight a prior arrest gets, and nobody can read them off. For decisions about someone's liberty, @rudin2019stop argues for models people can inspect, and simple models often predict recidivism about as well as complex ones [@rudin2020secrecy]. An agency may reasonably prefer a checklist that is a little less accurate. The results here tell you how much accuracy you give up for that choice at a given sample size.
+
+More accurate is not the same as fair. The appendix reports the challenge's fairness measure, the difference in false positive rates between Black and White parolees at a 0.5 threshold, for the unadjusted predictions. There is no guarantee a better model narrows that gap, and equal error rates are one of several fairness definitions that conflict with each other [@chohlas2026learning]. In practice a more accurate model often makes it easier to meet a fairness constraint, since the scores separate the groups' outcomes better. If a constraint is required, the predictions can be post-processed to meet it, for example by setting group-specific thresholds to equalize the false positive rate [@wheeler2026conformal].
+
+The models also need hardware. The small Kumo model ran in about 90 seconds on the full round 1 sample on an older consumer GPU with 4 GB of memory (a GeForce GTX 1650), and took over ten minutes on a four-core CPU. For a risk tool that scores a batch of cases once a week that does not matter. It does mean an agency needs either a GPU or patience.
+
+Last, this is one dataset. The NIJ data are clean, the features were prepared by NIJ, and the outcome is a single arrest indicator. Local agency data are messier. That is an argument for the foundation models, since they accept messy columns as is, but it is an argument I have not tested here.
+
+# AI use disclosure
+
+The code, analysis, and text were produced with Claude Code (Anthropic, Claude Opus 5.5) under my direction. I specified the research question, the NIJ data and the three rounds, the conditioning of rounds 2 and 3 on the prior rounds, the comparison models, the sample sizes and ten replications, the feature engineering from my earlier posts and the Circo and Wheeler replication, the leaderboard comparison, the appendix analyses, and the sources to cite for the introduction and discussion. All numbers and figures are computed from the data and scripts in the repository.
+
+# References {-}
+
+::: {#refs}
+:::
+
+\clearpage
+
+# Appendix {-}
+
+## A. Other tabular foundation models {-}
+
+```{python}
+#| label: tbl-tfm
+#| output: asis
+rows = []
+TFM = ["kumo_small", "tabicl", "tabpfn", "catboost"]
+sizes_tfm = [500, 1000, 2000, 4000]
+for rnd in [1, 2, 3]:
+    for size in sizes_tfm + ["full"]:
+        row = {"Round": str(rnd), "Sample": "Full" if size == "full" else com(size)}
+        for m in TFM:
+            try:
+                row[LABELS[m]] = f"{num(S(m, rnd, size, 'brier'), 4)} / {num(S(m, rnd, size, 'auc'), 3)}"
+            except IndexError:
+                row[LABELS[m]] = "--"
+        rows.append(row)
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Brier score / AUC on the NIJ test sample for three tabular foundation models and CatBoost, raw features. Means over ten random training samples, three for TabPFN v2, which was run only up to 2,000 people.")
+```
+
+Kumo is not the only foundation model that works here. TabICLv2 [@qu2026tabiclv2] and TabPFN version 2 [@hollmann2025tabpfn] both beat CatBoost at the small sample sizes in round 1, and all three foundation models are within a few thousandths of each other there. Kumo is the best of the three in most cells, and its lead is clearest in round 2. TabICLv2 ran about as fast as Kumo on my GPU. TabPFN version 2 is limited to 10,000 training rows by its authors and was much slower, `{python} com(pd.read_csv('results/samples/raw_tabpfn.csv').query("group=='All' and size==2000")['seconds'].median())` seconds per fit at 2,000 people against `{python} com(raw_all.query("model=='kumo_small' and group=='All' and size==2000 and features=='raw'")['seconds'].median())` for Kumo, so I only ran it up to 2,000 people with three samples per size. The ranking among the foundation models could easily change with newer versions. The point is that the gain over tuned boosting is not specific to one model.
+
+## B. Raw versus engineered features {-}
+
+```{python}
+#| label: tbl-fe
+#| output: asis
+rows = []
+for rnd in [1, 2, 3]:
+    for m in MAIN:
+        r_b, f_b = S(m, rnd, "full", "brier"), S(m, rnd, "full", "brier", features="fe")
+        r_a, f_a = S(m, rnd, "full", "auc"), S(m, rnd, "full", "auc", features="fe")
+        rows.append({"Round": str(rnd), "Model": LABELS[m],
+                     "Brier raw": num(r_b, 4), "Brier engineered": num(f_b, 4),
+                     "AUC raw": num(r_a, 3), "AUC engineered": num(f_a, 3)})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": Full training sample, raw NIJ columns against the engineered features, NIJ test sample, mean of ten seeds.")
+```
+
+The feature engineering barely matters with the full samples. The tree models move by a thousandth of a Brier point or less either way, and Kumo moves by less than that. Logistic regression is the one case where the engineered version is worse, `{python} num(S('logit',1,'full','brier',features='fe'),4)` against `{python} num(S('logit',1,'full','brier'),4)` in round 1. The raw version dummy codes every category, so it can fit a separate effect for each level of a count like prior felony arrests, while the engineered version treats those counts as a straight line. A tree model does not care about the difference, which is part of why it did not matter much for the other models.
+
+## C. NIJ fairness metric {-}
+
+```{python}
+#| label: tbl-fair
+#| output: asis
+rows = []
+for rnd in [1, 2, 3]:
+    for m in MAIN:
+        try:
+            f = report.fairness(report.preds(rnd, "raw", m)).set_index("sex")
+        except FileNotFoundError:
+            continue
+        for sex in ["Men", "Women"]:
+            r = f.loc[sex]
+            rows.append({"Round": str(rnd), "Model": LABELS[m], "Sex": sex,
+                         "FPR Black": pct(r["fpr_Black"], 1), "FPR White": pct(r["fpr_White"], 1),
+                         "Difference": pct(r["diff"], 1), "Brier": num(r["brier"], 4),
+                         "NIJ score": num(r["nij_score"], 4)})
+print(pd.DataFrame(rows).to_markdown(index=False, disable_numparse=True))
+print()
+print(": False positive rates at a 0.5 threshold, among people not arrested, for Black and White parolees, with the unadjusted predictions from the full training sample (first seed). The NIJ score is (1 - Brier) x (1 - |difference|) [@nij2021challenge].")
+```
+
+The NIJ fairness penalty only counts people predicted at 0.5 or above, and few people clear that bar. In round 1 about 10% of men and 1 to 2% of women are above 0.5 for most models, and in round 3 almost nobody is. So the false positive rates are small and so are the gaps between Black and White parolees, a point or two at most. The largest gap is logistic regression for men in round 2, about 2 points. Kumo's gaps are no larger than the other models'. A model with no one above 0.5 has a gap of zero, which is why this penalty could be won by clipping predictions [@mohler2021note; @circo2025replication]. These are the unadjusted predictions; for a threshold that means something in practice, the thresholds can be set by group to equalize the false positive rate [@wheeler2026conformal].
